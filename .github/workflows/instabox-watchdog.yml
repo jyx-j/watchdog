@@ -1,0 +1,213 @@
+name: instabox-watchdog
+
+# 单文件版：脚本直接内嵌在下面，不需要额外的 scripts/ 目录。
+# 用法：把本文件放到仓库的 .github/workflows/instabox-watchdog.yml，
+# 再到 Settings -> Secrets and variables -> Actions 加 IB_KEY_1 / IB_KEY_2 两个 secret。
+
+on:
+  schedule:
+    # 每 10 分钟。GitHub 的 cron 是 best-effort，高峰会晚几分钟到十几分钟，正常。
+    # 私有仓库请改成 "*/30"，否则按每 job 计 1 分钟算会超出每月 2000 分钟免费额度。
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "只打印计划，不执行任何写操作"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: instabox-watchdog
+  cancel-in-progress: false
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: 巡检两台机器
+        env:
+          # 标签:Secrets 名，可按需改名
+          IB_ACCOUNTS: "acct1:IB_KEY_1,acct2:IB_KEY_2"
+          IB_KEY_1: ${{ secrets.IB_KEY_1 }}
+          IB_KEY_2: ${{ secrets.IB_KEY_2 }}
+          IB_DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && '1' || '0' }}
+        run: |
+          python3 - <<'PY'
+          #!/usr/bin/env python3
+          """InstaBox 第三方看门狗（GitHub Actions 版）。
+
+          作用：在 GitHub 的服务器上每 10 分钟巡检两台机器，是双机互保之外的第三方兜底，
+          用来打破「两边 loop 都挂 → 互相等不到对方 → 双双闲置休眠」的死锁。
+
+          每台机器按状态处理：
+          - running：运行时长 >= 475 分钟就主动 suspend→resume（比机器内 loop 的 440/470 更晚，
+            正常情况下轮不到它，只有机器内 loop 死了才由这里兜）；否则 exec 一次刷活跃。
+          - suspended / stopped：尊重平台返回的 cooldownUntil，没到点就跳过，到点就 resume / start。
+          - 过渡态（starting / suspending 等）：跳过，下一轮再看。
+
+          只用标准库，无需 pip 安装。Key 从环境变量读，绝不打印。
+
+          环境变量：
+            IB_ACCOUNTS  账号映射，格式 "标签:环境变量名,标签:环境变量名"
+                         默认 "acct1:IB_KEY_1,acct2:IB_KEY_2"
+            IB_KEY_1 ... 各账号的 API Key（由 GitHub Secrets 注入）
+            IB_DRY_RUN   设为 1 时只打印计划，不做任何写操作
+          """
+          import json
+          import os
+          import sys
+          import time
+          import urllib.error
+          import urllib.request
+          import uuid
+
+          BASE = "https://api.instabox.sh"
+          EXEC_CMD = "if [ -x /data/watchdog.sh ]; then sudo /data/watchdog.sh; else date; fi"
+          ROTATE_AFTER = 475 * 60          # 秒：比机器内 loop 的 440/470 更晚，平时轮不到
+          WAKE_EARLY = 10                  # 冷却结束前 10 秒开始唤醒
+          TRANSIENT = {"creating", "starting", "stopping", "suspending", "resuming", "deleting"}
+          LIFECYCLE = ("/suspend", "/resume", "/start", "/stop")
+          DRY = os.environ.get("IB_DRY_RUN") == "1"
+
+          rows = []
+
+
+          def call(method, path, key, body=None, timeout=45):
+              data = json.dumps(body).encode() if body is not None else None
+              req = urllib.request.Request(BASE + path, data=data, method=method,
+                                           headers={"Content-Type": "application/json",
+                                                    "X-API-Key": key.strip()})
+              if path.endswith(LIFECYCLE):
+                  req.add_header("Idempotency-Key", str(uuid.uuid4()))
+              try:
+                  with urllib.request.urlopen(req, timeout=timeout) as r:
+                      return json.loads(r.read().decode("utf-8", "replace") or "{}")
+              except urllib.error.HTTPError as e:
+                  raise RuntimeError(f"HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:200]}")
+              except (urllib.error.URLError, TimeoutError) as e:
+                  raise RuntimeError(f"网络错误: {e}")
+
+
+          def epoch(s):
+              from datetime import datetime
+              try:
+                  return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+              except (AttributeError, ValueError):
+                  return 0
+
+
+          def wait_state(mid, key, want, limit=120):
+              end = time.time() + limit
+              while time.time() < end:
+                  time.sleep(3)
+                  try:
+                      if call("GET", f"/v1/machines/{mid}", key).get("state") == want:
+                          return True
+                  except RuntimeError:
+                      pass
+              return False
+
+
+          def handle(name, m, key, now):
+              mid, state = m["id"], m.get("state")
+              run0 = epoch(m.get("runStartedAt"))
+              run_min = int((now - run0) / 60) if run0 else -1
+
+              if state == "running":
+                  if run0 and now - run0 >= ROTATE_AFTER:
+                      if DRY:
+                          return f"计划轮换（已跑 {run_min} 分钟）"
+                      call("POST", f"/v1/machines/{mid}/suspend", key)
+                      if not wait_state(mid, key, "suspended"):
+                          raise RuntimeError("suspend 120 秒内没完成")
+                      call("POST", f"/v1/machines/{mid}/resume", key)
+                      if not wait_state(mid, key, "running"):
+                          raise RuntimeError("resume 120 秒内没回到 running")
+                      return f"已轮换（跑了 {run_min} 分钟，超过 475 兜底线）"
+                  if DRY:
+                      return f"计划 exec（已跑 {run_min} 分钟）"
+                  r = call("POST", f"/v1/machines/{mid}/exec", key,
+                           {"cmd": EXEC_CMD, "timeoutSeconds": 120}, timeout=150)
+                  if r.get("exitCode") != 0:
+                      return f"exec 完成但退出码 {r.get('exitCode')}（不计失败，活跃已计入）"
+                  return f"exec 成功（已跑 {run_min} 分钟）"
+
+              if state in ("suspended", "stopped"):
+                  action = "resume" if state == "suspended" else "start"
+                  cool = epoch(m.get("cooldownUntil"))
+                  if cool and now < cool - WAKE_EARLY:
+                      return f"{state}，冷却中，{int(cool - now)} 秒后再叫"
+                  if DRY:
+                      return f"计划 {action}"
+                  call("POST", f"/v1/machines/{mid}/{action}", key)
+                  return f"已发送 {action}（原状态 {state}）"
+
+              if state in TRANSIENT:
+                  return f"{state}，过渡态，跳过"
+              raise RuntimeError(f"状态 {state} 无法自动处理")
+
+
+          def main():
+              mapping = os.environ.get("IB_ACCOUNTS", "acct1:IB_KEY_1,acct2:IB_KEY_2")
+              accounts = []
+              missing = []
+              for part in mapping.split(","):
+                  part = part.strip()
+                  if not part:
+                      continue
+                  label, _, env_name = part.partition(":")
+                  key = os.environ.get(env_name.strip())
+                  if not key:
+                      print(f"[{label}] 缺少 secret {env_name.strip()}")
+                      rows.append((label, "-", "失败", f"没有配置 {env_name.strip()}"))
+                      missing.append((label, env_name.strip()))
+                      continue
+                  accounts.append((label.strip(), key))
+
+              now = time.time()
+              failed = 0
+              for label, key in accounts:
+                  try:
+                      machines = call("GET", "/v1/machines", key).get("machines", [])
+                  except RuntimeError as e:
+                      print(f"[{label}] 读取机器列表失败: {e}")
+                      rows.append((label, "-", "失败", str(e)[:80]))
+                      failed += 1
+                      continue
+                  if not machines:
+                      print(f"[{label}] 名下没有机器")
+                      rows.append((label, "-", "无机器", ""))
+                      continue
+                  for m in machines:
+                      name = m.get("name") or m["id"]
+                      try:
+                          result = handle(name, m, key, now)
+                          print(f"[{label}] {name}: {result}")
+                          rows.append((label, name, "ok", result))
+                      except Exception as e:
+                          print(f"[{label}] {name}: 失败 - {e}")
+                          rows.append((label, name, "失败", str(e)[:80]))
+                          failed += 1
+
+              summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary:
+                  with open(summary, "a", encoding="utf-8") as f:
+                      f.write("| 账号 | 机器 | 结果 | 说明 |\n|---|---|---|---|\n")
+                      for r in rows:
+                          f.write("| " + " | ".join(str(x).replace("|", "/") for x in r) + " |\n")
+
+              if missing:
+                  print("缺少密钥，无法巡检：" + "、".join(f"{l} 的 secret {e}" for l, e in missing))
+                  print("请到仓库 Settings -> Secrets and variables -> Actions 里添加。")
+                  failed += len(missing)
+              print(f"完成：{len(rows)} 台，失败 {failed}")
+              return 1 if failed else 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PY
